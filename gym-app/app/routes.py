@@ -1,24 +1,51 @@
-# routes.py
 from flask import Blueprint, jsonify, request
-from datetime import date, datetime, time, timedelta
-from sqlalchemy import func, and_
+from datetime import date, timedelta, datetime
+from decimal import Decimal
+from sqlalchemy import func
 from . import db
 from .models import Cliente, Membresia, Pago, Asistencia, ClienteMembresia
 
 bp = Blueprint("api", __name__)
 
-# -------- Helpers --------
-def to_float(x):
-    """Convierte Decimal/None a float seguro para JSON."""
-    if x is None:
-        return 0.0
-    try:
-        return float(x)
-    except Exception:
-        # último recurso: str, pero preferimos float para totales
-        return float(str(x))
+# -------------------- Helpers --------------------
 
-# -------- CLIENTES --------
+def _decimal(v):
+    """Asegura tipo Decimal para montos numéricos."""
+    if v is None:
+        return Decimal("0")
+    if isinstance(v, Decimal):
+        return v
+    try:
+        return Decimal(str(v))
+    except Exception:
+        return Decimal("0")
+
+def _cerrar_membresias_activas(cliente_id, fecha_fin=None):
+    """Marca 'vencida' cualquier membresía activa del cliente."""
+    hoy = date.today()
+    ll = (
+        ClienteMembresia.query
+        .filter_by(cliente_id=cliente_id, estado="activa")
+        .all()
+    )
+    for cm in ll:
+        cm.estado = "vencida"
+        # opcional: si quieres ajustar fecha_fin al día anterior
+        if fecha_fin:
+            cm.fecha_fin = fecha_fin
+    db.session.flush()
+
+def _last_plan(cliente_id):
+    """Último plan del cliente por fecha_fin."""
+    return (
+        ClienteMembresia.query
+        .filter(ClienteMembresia.cliente_id == cliente_id)
+        .order_by(ClienteMembresia.fecha_fin.desc())
+        .first()
+    )
+
+# -------------------- CLIENTES --------------------
+
 @bp.get("/clientes")
 def get_clientes():
     clientes = Cliente.query.all()
@@ -47,23 +74,25 @@ def crear_cliente():
     )
     db.session.add(nuevo)
     db.session.commit()
-    return jsonify({"msg": "cliente creado"}), 201
+    return jsonify({"msg": "cliente creado", "cliente_id": nuevo.cliente_id}), 201
 
-# -------- MEMBRESÍAS --------
+# -------------------- MEMBRESÍAS --------------------
+
 @bp.get("/membresias")
 def get_membresias():
     rows = Membresia.query.all()
-    data = [
-        {
-            "membresia_id": m.membresia_id,
-            "nombre": m.nombre,
-            "descripcion": m.descripcion,
-            "duracion_dias": m.duracion_dias,
-            "precio": float(m.precio) if m.precio is not None else 0.0,
-        }
-        for m in rows
-    ]
-    return jsonify(data)
+    return jsonify(
+        [
+            {
+                "membresia_id": m.membresia_id,
+                "nombre": m.nombre,
+                "descripcion": m.descripcion,
+                "precio": float(m.precio),
+                "duracion_dias": m.duracion_dias,
+            }
+            for m in rows
+        ]
+    )
 
 @bp.post("/membresias")
 def crear_membresia():
@@ -71,18 +100,18 @@ def crear_membresia():
     nueva = Membresia(
         nombre=data["nombre"],
         descripcion=data.get("descripcion", ""),
-        precio=data["precio"],
-        duracion_dias=data["duracion_dias"],
+        precio=_decimal(data["precio"]),
+        duracion_dias=int(data["duracion_dias"]),
     )
     db.session.add(nueva)
     db.session.commit()
-    return jsonify({"msg": "membresía creada"}), 201
+    return jsonify({"msg": "membresía creada", "membresia_id": nueva.membresia_id}), 201
 
-# -------- MEMBRESÍA ACTIVA --------
+# -------------------- MEMBRESÍA ACTIVA --------------------
+
 @bp.get("/clientes/<int:cliente_id>/membresias/activa")
 def membresia_activa(cliente_id):
     hoy = date.today()
-    # Tomamos la última relación activa (si existe)
     cm = (
         ClienteMembresia.query.filter_by(cliente_id=cliente_id, estado="activa")
         .order_by(ClienteMembresia.fecha_fin.desc())
@@ -97,7 +126,7 @@ def membresia_activa(cliente_id):
     return jsonify(
         {
             "nombre_plan": cm.membresia.nombre,
-            "precio": to_float(cm.membresia.precio),  # <- Decimal -> float
+            "precio": float(cm.membresia.precio),
             "fecha_inicio": str(cm.fecha_inicio),
             "fecha_fin": str(cm.fecha_fin),
             "dias_restantes": dias_rest,
@@ -105,63 +134,143 @@ def membresia_activa(cliente_id):
         }
     )
 
-# -------- PAGOS --------
+# -------------------- PAGOS (caja del día) --------------------
+
 @bp.get("/pagos/hoy")
 def pagos_hoy():
     hoy = date.today()
-    # Ventana de día completo para portabilidad entre motores
-    inicio = datetime.combine(hoy, time.min)
-    fin = datetime.combine(hoy, time.max)
-
     pagos = (
-        Pago.query
-        .join(Cliente, Pago.cliente_id == Cliente.cliente_id)
-        .filter(Pago.fecha_pago.between(inicio, fin))
+        db.session.query(
+            Pago.pago_id,
+            Pago.monto,
+            Pago.metodo_pago,
+            func.strftime("%H:%M", Pago.fecha_pago).label("hora"),
+            Cliente.nombre,
+            Cliente.apellido,
+            Cliente.rut,
+        )
+        .join(Cliente, Cliente.cliente_id == Pago.cliente_id)
+        .filter(func.date(Pago.fecha_pago) == hoy)
         .order_by(Pago.fecha_pago.desc())
         .all()
     )
 
-    data = []
-    for p in pagos:
-        c = p.cliente
-        data.append(
-            {
-                "pago_id": p.pago_id,
-                "monto": to_float(p.monto),                 # <- Decimal -> float
-                "metodo_pago": p.metodo_pago,
-                "hora": p.fecha_pago.strftime("%H:%M"),
-                "nombre": c.nombre,
-                "apellido": c.apellido,
-                "rut": c.rut,
-            }
-        )
+    data = [
+        {
+            "pago_id": p.pago_id,
+            "monto": float(p.monto),
+            "metodo_pago": p.metodo_pago,
+            "hora": p.hora,
+            "nombre": p.nombre,
+            "apellido": p.apellido,
+            "rut": p.rut,
+        }
+        for p in pagos
+    ]
 
     resumen = {
-        "total_general": sum(item["monto"] for item in data),
-        "total_efectivo": sum(item["monto"] for item in data if item["metodo_pago"] == "Efectivo"),
-        "total_tarjeta": sum(item["monto"] for item in data if item["metodo_pago"] == "Tarjeta"),
-        "total_transferencia": sum(item["monto"] for item in data if item["metodo_pago"] == "Transferencia"),
+        "total_general": float(sum(p["monto"] for p in data)),
+        "total_efectivo": float(sum(p["monto"] for p in data if p["metodo_pago"] == "Efectivo")),
+        "total_tarjeta": float(sum(p["monto"] for p in data if p["metodo_pago"] == "Tarjeta")),
+        "total_transferencia": float(sum(p["monto"] for p in data if p["metodo_pago"] == "Transferencia")),
     }
 
     return jsonify({"pagos": data, "resumen": resumen})
 
-# -------- ASISTENCIAS --------
+# ---------- ASIGNAR / RENOVAR + PAGO (endpoint que faltaba) ----------
+
+@bp.post("/clientes/<int:cliente_id>/pagos/pagar_y_renovar")
+def pagar_y_renovar(cliente_id):
+    """
+    Si viene 'membresia_id' => Asignar ese plan + pago (cierra las activas previas).
+    Si NO viene 'membresia_id' => Renovar el último plan + pago.
+    Body JSON: { membresia_id?, monto, metodo_pago }
+    """
+    payload = request.json or {}
+    monto = _decimal(payload.get("monto"))
+    metodo = (payload.get("metodo_pago") or "Efectivo").strip()
+    hoy = date.today()
+
+    cliente = Cliente.query.get(cliente_id)
+    if not cliente:
+        return jsonify({"error": "cliente no existe"}), 404
+
+    # --- decidir plan a utilizar ---
+    membresia_id = payload.get("membresia_id")
+    plan = None
+    if membresia_id:
+        plan = Membresia.query.get(int(membresia_id))
+        if not plan:
+            return jsonify({"error": "membresía no existe"}), 404
+    else:
+        # renovar sobre el último plan del cliente
+        last = _last_plan(cliente_id)
+        if not last:
+            return jsonify({"error": "no hay plan previo para renovar"}), 400
+        plan = last.membresia
+
+    # --- cerrar activas previas y crear/renovar ---
+    _cerrar_membresias_activas(cliente_id)
+
+    fecha_inicio = hoy
+    fecha_fin = hoy + timedelta(days=int(plan.duracion_dias))
+
+    cm = ClienteMembresia(
+        cliente_id=cliente_id,
+        membresia_id=plan.membresia_id,
+        fecha_inicio=fecha_inicio,
+        fecha_fin=fecha_fin,
+        estado="activa",
+    )
+    db.session.add(cm)
+    db.session.flush()  # para tener cm.cliente_membresia_id
+
+    # --- crear pago ---
+    pago = Pago(
+        cliente_id=cliente_id,
+        cliente_membresia_id=cm.cliente_membresia_id,
+        monto=monto,
+        metodo_pago=metodo,
+        fecha_pago=datetime.utcnow(),
+    )
+    db.session.add(pago)
+    db.session.commit()
+
+    return jsonify({
+        "msg": "pago y (re)asignación realizados",
+        "cliente_membresia_id": cm.cliente_membresia_id,
+        "membresia": {
+            "membresia_id": plan.membresia_id,
+            "nombre": plan.nombre,
+            "duracion_dias": plan.duracion_dias,
+            "precio": float(plan.precio),
+            "fecha_inicio": str(cm.fecha_inicio),
+            "fecha_fin": str(cm.fecha_fin),
+        },
+        "pago": {
+            "pago_id": pago.pago_id,
+            "monto": float(pago.monto),
+            "metodo_pago": pago.metodo_pago,
+            "fecha_pago": pago.fecha_pago.isoformat(),
+        }
+    }), 201
+
+# -------------------- ASISTENCIAS --------------------
+
 @bp.post("/asistencias")
 def marcar_asistencia():
     data = request.json or {}
-    cliente_id = data["cliente_id"]
+    cliente_id = int(data["cliente_id"])
     tipo = data["tipo"]
 
-    # Verificar membresía activa para "entrada"
     hoy = date.today()
-    if tipo == "entrada":
-        cm = (
-            ClienteMembresia.query.filter_by(cliente_id=cliente_id, estado="activa")
-            .order_by(ClienteMembresia.fecha_fin.desc())
-            .first()
-        )
-        if not cm or cm.fecha_fin < hoy:
-            return jsonify({"error": "sin membresía activa"}), 403
+    cm = (
+        ClienteMembresia.query.filter_by(cliente_id=cliente_id, estado="activa")
+        .order_by(ClienteMembresia.fecha_fin.desc())
+        .first()
+    )
+    if not cm or cm.fecha_fin < hoy:
+        return jsonify({"error": "sin membresía activa"}), 403
 
     asistencia = Asistencia(cliente_id=cliente_id, tipo=tipo)
     db.session.add(asistencia)
@@ -171,38 +280,39 @@ def marcar_asistencia():
 @bp.get("/asistencias/hoy")
 def asistencias_hoy():
     hoy = date.today()
-    inicio = datetime.combine(hoy, time.min)
-    fin = datetime.combine(hoy, time.max)
-
     asist = (
-        Asistencia.query
-        .join(Cliente, Asistencia.cliente_id == Cliente.cliente_id)
-        .filter(Asistencia.fecha_hora.between(inicio, fin))
+        db.session.query(
+            Asistencia.asistencia_id,
+            Cliente.nombre,
+            Cliente.apellido,
+            Cliente.rut,
+            Cliente.cliente_id,
+            func.strftime("%H:%M", Asistencia.fecha_hora).label("hora"),
+        )
+        .join(Cliente, Cliente.cliente_id == Asistencia.cliente_id)
+        .filter(func.date(Asistencia.fecha_hora) == hoy)
         .order_by(Asistencia.fecha_hora.desc())
         .all()
     )
-
-    data = []
-    for a in asist:
-        c = a.cliente
-        data.append(
-            {
-                "asistencia_id": a.asistencia_id,
-                "nombre": c.nombre,
-                "apellido": c.apellido,
-                "rut": c.rut,
-                "cliente_id": c.cliente_id,
-                "hora": a.fecha_hora.strftime("%H:%M"),
-            }
-        )
+    data = [
+        {
+            "asistencia_id": a.asistencia_id,
+            "nombre": a.nombre,
+            "apellido": a.apellido,
+            "rut": a.rut,
+            "cliente_id": a.cliente_id,
+            "hora": a.hora,
+        }
+        for a in asist
+    ]
     return jsonify(data)
 
-# -------- VENCIMIENTOS PRÓXIMOS (≤3 días) --------
+# -------------------- VENCIMIENTOS ≤ 3 días --------------------
+
 @bp.get("/vencimientos_proximos")
 def vencimientos_proximos():
     hoy = date.today()
     limite = hoy + timedelta(days=3)
-
     rows = (
         db.session.query(
             ClienteMembresia.cliente_membresia_id,
