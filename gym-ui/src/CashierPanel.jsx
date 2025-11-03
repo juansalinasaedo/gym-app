@@ -287,8 +287,11 @@ export default function CashierPanel() {
       setMsg("✅ Entrada registrada");
       await fetchAsistenciasHoy();
     } catch (err) {
-      if (err?.response?.status === 403) {
+      const status = err?.response?.status || err?.status;
+      if (status === 403) {
         setMsg("🚫 Acceso denegado: el cliente no tiene membresía activa.");
+      } else if (status === 409) {
+        setMsg("⚠️ Ya existe una entrada registrada hoy para este cliente.");
       } else {
         setMsg("❌ Error al registrar entrada");
       }

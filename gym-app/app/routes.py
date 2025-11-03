@@ -2,10 +2,15 @@ from flask import Blueprint, jsonify, request
 from datetime import date, timedelta, datetime
 from decimal import Decimal
 from sqlalchemy import func, cast, Date
+from zoneinfo import ZoneInfo
 from . import db
 from .models import Cliente, Membresia, Pago, Asistencia, ClienteMembresia
 
 bp = Blueprint("api", __name__)
+
+CHILE_TZ = ZoneInfo("America/Santiago")
+def hoy_chile_date():
+    return datetime.now(CHILE_TZ).date()
 
 # -------------------- Helpers --------------------
 
@@ -266,17 +271,41 @@ def marcar_asistencia():
     cliente_id = int(data["cliente_id"])
     tipo = data["tipo"]
 
-    hoy = date.today()
+     # 1) Verificar membresía activa
+    hoy = hoy_chile_date()
     cm = (
-        ClienteMembresia.query.filter_by(cliente_id=cliente_id, estado="activa")
+        ClienteMembresia.query
+        .filter(ClienteMembresia.cliente_id == cliente_id,
+                ClienteMembresia.estado == "activa")
         .order_by(ClienteMembresia.fecha_fin.desc())
         .first()
     )
     if not cm or cm.fecha_fin < hoy:
-        return jsonify({"error": "sin membresía activa"}), 403
+        return jsonify({"error": "sin_membresia_activa"}), 403
 
-    asistencia = Asistencia(cliente_id=cliente_id, tipo=tipo)
-    db.session.add(asistencia)
+    # 2) Bloquear segunda "entrada" del mismo día
+    if tipo == "entrada":
+        ya_entro_hoy = (
+            db.session.query(Asistencia.asistencia_id)
+            .filter(
+                Asistencia.cliente_id == cliente_id,
+                Asistencia.tipo == "entrada",
+                func.date(Asistencia.fecha_hora) == hoy
+            )
+            .first()
+        )
+        if ya_entro_hoy:
+            return (
+                jsonify({
+                    "error": "entrada_duplicada",
+                    "message": "El cliente ya registró una entrada hoy."
+                }),
+                409,  # Conflict
+            )
+
+    # 3) Registrar asistencia
+    a = Asistencia(cliente_id=cliente_id, tipo=tipo)
+    db.session.add(a)
     db.session.commit()
     return jsonify({"msg": "asistencia registrada"}), 201
 
