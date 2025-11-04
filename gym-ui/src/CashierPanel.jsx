@@ -114,6 +114,10 @@ export default function CashierPanel() {
   const [asistenciasHoy, setAsistenciasHoy] = useState([]);
   const [loadingEntradaRapida, setLoadingEntradaRapida] = useState(false);
 
+  // Control de doble entrada
+  const [yaEntroHoy, setYaEntroHoy] = useState(false);
+  const [horaPrimeraEntrada, setHoraPrimeraEntrada] = useState("");
+
   // --------- Vencimientos próximos (≤3 días) ----------
   const [vencimientos, setVencimientos] = useState([]);
 
@@ -126,7 +130,7 @@ export default function CashierPanel() {
       setClientes(data);
     } catch (err) {
       console.error(err);
-      setMsg(`❌ ${err.message || "Error al asignar y pagar"}`);
+      setMsg(`❌ ${err.message || "Error al cargar clientes"}`);
     }
   }
 
@@ -285,13 +289,20 @@ export default function CashierPanel() {
         tipo: "entrada",
       });
       setMsg("✅ Entrada registrada");
-      await fetchAsistenciasHoy();
+      await fetchAsistenciasHoy(); // gatilla el cálculo de yaEntroHoy
     } catch (err) {
       const status = err?.response?.status || err?.status;
-      if (status === 403) {
+      if (status === 409) {
+        // Doble entrada: bloqueamos el botón y mostramos la hora
+        setYaEntroHoy(true);
+        if (err?.data?.ultima_hora) setHoraPrimeraEntrada(err.data.ultima_hora);
+        setMsg(
+          `⚠️ Ya existe una ENTRADA registrada hoy${
+            err?.data?.ultima_hora ? ` a las ${err.data.ultima_hora}` : ""
+          }.`
+        );
+      } else if (status === 403) {
         setMsg("🚫 Acceso denegado: el cliente no tiene membresía activa.");
-      } else if (status === 409) {
-        setMsg("⚠️ Ya existe una entrada registrada hoy para este cliente.");
       } else {
         setMsg("❌ Error al registrar entrada");
       }
@@ -328,10 +339,30 @@ export default function CashierPanel() {
   useEffect(() => {
     if (!clienteId) {
       setInfoMembresia(null);
+      // al cambiar de cliente, reseteamos estado de "ya entró hoy"
+      setYaEntroHoy(false);
+      setHoraPrimeraEntrada("");
       return;
     }
     fetchInfoMembresiaActiva(clienteId);
   }, [clienteId]);
+
+  // Determinar si el cliente ya tiene ENTRADA hoy
+  useEffect(() => {
+    if (!clienteId) {
+      setYaEntroHoy(false);
+      setHoraPrimeraEntrada("");
+      return;
+    }
+    const hit = asistenciasHoy.find((a) => String(a.cliente_id) === String(clienteId));
+    if (hit) {
+      setYaEntroHoy(true);
+      setHoraPrimeraEntrada(hit.hora || "");
+    } else {
+      setYaEntroHoy(false);
+      setHoraPrimeraEntrada("");
+    }
+  }, [clienteId, asistenciasHoy]);
 
   // Sugerencias (máx 10)
   const sugerencias = useMemo(() => {
@@ -363,6 +394,20 @@ export default function CashierPanel() {
     setShowSug(false);
     setHiIndex(-1);
   }
+
+  // === Formateador de hora para la tabla de asistencias ===
+  const horaBonita = (row) => {
+    if (row.hora) return row.hora; // viene formateada desde backend
+    if (row.fecha_hora) {
+      try {
+        const d = new Date(row.fecha_hora);
+        return d.toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" });
+      } catch {
+        /* ignore */
+      }
+    }
+    return "";
+  };
 
   return (
     <div className="p-5 max-w-6xl mx-auto">
@@ -438,7 +483,7 @@ export default function CashierPanel() {
             )}
           </div>
 
-          {/* resumen del cliente + membresía actual + botón Entrada (1 clic) */}
+          {/* resumen del cliente + membresía actual + botón Entrada */}
           <div className="md:col-span-2">
             {clienteSel ? (
               <div className="p-3 border rounded h-full flex flex-col gap-3 bg-gray-50 text-xs">
@@ -527,11 +572,24 @@ export default function CashierPanel() {
                       <div className="shrink-0">
                         <button
                           onClick={marcarEntradaRapida}
-                          disabled={loadingEntradaRapida}
-                          className="bg-gray-900 hover:bg-black text-white rounded px-3 py-2 text-xs"
-                          title="Registrar entrada inmediata"
+                          disabled={loadingEntradaRapida || yaEntroHoy}
+                          className={
+                            "rounded px-3 py-2 text-xs " +
+                            (yaEntroHoy
+                              ? "bg-gray-300 text-gray-600 cursor-not-allowed"
+                              : "bg-gray-900 hover:bg-black text-white")
+                          }
+                          title={
+                            yaEntroHoy
+                              ? "Ya se registró una entrada hoy"
+                              : "Registrar entrada inmediata"
+                          }
                         >
-                          {loadingEntradaRapida ? "Marcando..." : "Entrada (1 clic)"}
+                          {yaEntroHoy
+                            ? (horaPrimeraEntrada
+                                ? `Entrada registrada ${horaPrimeraEntrada}`
+                                : "Entrada ya registrada")
+                            : (loadingEntradaRapida ? "Marcando..." : "Entrada (1 clic)")}
                         </button>
                       </div>
                     )}
@@ -729,20 +787,31 @@ export default function CashierPanel() {
 
       {/* 4) Crear Plan */}
       <Section title="4) Crear Plan">
-        <form onSubmit={e => { e.preventDefault(); setLoading(true); setMsg(null);
-          apiCrearMembresia({
-            ...membresiaNueva,
-            duracion_dias: Number(membresiaNueva.duracion_dias),
-            precio: Number(membresiaNueva.precio),
-          })
-            .then(() => {
-              setMsg("✅ Membresía creada");
-              setMembresiaNueva({ nombre: "", descripcion: "", duracion_dias: 30, precio: 25000 });
-              return fetchMembresias();
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            setLoading(true);
+            setMsg(null);
+            apiCrearMembresia({
+              ...membresiaNueva,
+              duracion_dias: Number(membresiaNueva.duracion_dias),
+              precio: Number(membresiaNueva.precio),
             })
-            .catch(() => setMsg("❌ Error al crear membresía"))
-            .finally(() => setLoading(false));
-        }} className="border rounded p-3 bg-gray-50">
+              .then(() => {
+                setMsg("✅ Membresía creada");
+                setMembresiaNueva({
+                  nombre: "",
+                  descripcion: "",
+                  duracion_dias: 30,
+                  precio: 25000,
+                });
+                return fetchMembresias();
+              })
+              .catch(() => setMsg("❌ Error al crear membresía"))
+              .finally(() => setLoading(false));
+          }}
+          className="border rounded p-3 bg-gray-50"
+        >
           <div className="font-medium mb-2 text-sm text-gray-800">Crear nueva membresía</div>
           <input
             className="border rounded px-3 py-2 mb-2 w-full text-sm"
@@ -779,7 +848,10 @@ export default function CashierPanel() {
               }
             />
           </div>
-          <button className="bg-gray-900 text-white rounded px-4 py-2 w-full mt-2 text-sm" disabled={loading}>
+          <button
+            className="bg-gray-900 text-white rounded px-4 py-2 w-full mt-2 text-sm"
+            disabled={loading}
+          >
             {loading ? "Guardando..." : "Crear plan"}
           </button>
         </form>
@@ -804,7 +876,7 @@ export default function CashierPanel() {
                 {asistenciasHoy.map((a) => (
                   <tr key={a.asistencia_id} className="odd:bg-white even:bg-gray-50">
                     <td className="px-3 py-2 border-b border-gray-100 font-semibold text-gray-800">
-                      {a.hora}
+                      {horaBonita(a)}
                     </td>
                     <td className="px-3 py-2 border-b border-gray-100 text-gray-700">
                       {a.nombre} {a.apellido}

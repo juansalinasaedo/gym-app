@@ -1,16 +1,25 @@
 from flask import Blueprint, jsonify, request
-from datetime import date, timedelta, datetime
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
-from sqlalchemy import func, cast, Date
+from sqlalchemy import func, cast, Date  
+import pytz
 from zoneinfo import ZoneInfo
 from . import db
 from .models import Cliente, Membresia, Pago, Asistencia, ClienteMembresia
 
 bp = Blueprint("api", __name__)
 
-CHILE_TZ = ZoneInfo("America/Santiago")
-def hoy_chile_date():
-    return datetime.now(CHILE_TZ).date()
+APP_TZ = ZoneInfo("America/Santiago")
+CL_TZ = pytz.timezone("America/Santiago")
+def to_cl_time(dt):
+    """Convierte un datetime (naive o con tz) a America/Santiago."""
+    if dt is None:
+        return None
+    # asumimos que guardas en UTC; si viene naive lo tomamos como UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(APP_TZ).strftime("%H:%M")
 
 # -------------------- Helpers --------------------
 
@@ -149,27 +158,26 @@ def pagos_hoy():
             Pago.pago_id,
             Pago.monto,
             Pago.metodo_pago,
-            Pago.fecha_pago,
+            Pago.fecha_pago,      # 👈 datetime
             Cliente.nombre,
             Cliente.apellido,
             Cliente.rut,
         )
         .join(Cliente)
-        .filter(cast(Pago.fecha_pago, Date) == hoy)
+        .filter(cast(Pago.fecha_pago, Date) == hoy)  # 👈 agnóstico a motor
         .order_by(Pago.fecha_pago.desc())
         .all()
     )
 
     data = []
-    for p in pagos:
-        pago_id, monto, metodo_pago, fecha_pago, nombre, apellido, rut = p
-        hora_str = fecha_pago.strftime("%H:%M") if fecha_pago else None
+    for p_id, monto, metodo, fecha_pago, nombre, apellido, rut in pagos:
+        hora_local = to_cl_time(fecha_pago).strftime("%H:%M")
         data.append(
             {
-                "pago_id": pago_id,
-                "monto": float(monto),  # por si viene como Decimal
-                "metodo_pago": metodo_pago,
-                "hora": hora_str,
+                "pago_id": p_id,
+                "monto": float(monto),       # por si usas Numeric
+                "metodo_pago": metodo,
+                "hora": hora_local,
                 "nombre": nombre,
                 "apellido": apellido,
                 "rut": rut,
@@ -177,10 +185,10 @@ def pagos_hoy():
         )
 
     resumen = {
-        "total_general": sum(d["monto"] for d in data),
-        "total_efectivo": sum(d["monto"] for d in data if d["metodo_pago"] == "Efectivo"),
-        "total_tarjeta": sum(d["monto"] for d in data if d["metodo_pago"] == "Tarjeta"),
-        "total_transferencia": sum(d["monto"] for d in data if d["metodo_pago"] == "Transferencia"),
+        "total_general": sum(p["monto"] for p in data),
+        "total_efectivo": sum(p["monto"] for p in data if p["metodo_pago"] == "Efectivo"),
+        "total_tarjeta": sum(p["monto"] for p in data if p["metodo_pago"] == "Tarjeta"),
+        "total_transferencia": sum(p["monto"] for p in data if p["metodo_pago"] == "Transferencia"),
     }
     return jsonify({"pagos": data, "resumen": resumen})
 
@@ -269,82 +277,83 @@ def pagar_y_renovar(cliente_id):
 def marcar_asistencia():
     data = request.json or {}
     cliente_id = int(data["cliente_id"])
-    tipo = data["tipo"]
+    tipo = (data.get("tipo") or "entrada").lower()
 
-     # 1) Verificar membresía activa
-    hoy = hoy_chile_date()
-    cm = (
-        ClienteMembresia.query
-        .filter(ClienteMembresia.cliente_id == cliente_id,
-                ClienteMembresia.estado == "activa")
-        .order_by(ClienteMembresia.fecha_fin.desc())
-        .first()
-    )
-    if not cm or cm.fecha_fin < hoy:
-        return jsonify({"error": "sin_membresia_activa"}), 403
-
-    # 2) Bloquear segunda "entrada" del mismo día
+    # Solo 1 "entrada" por día
     if tipo == "entrada":
-        ya_entro_hoy = (
-            db.session.query(Asistencia.asistencia_id)
+        hoy = date.today()
+        existente = (
+            db.session.query(Asistencia)
             .filter(
                 Asistencia.cliente_id == cliente_id,
+                func.date(Asistencia.fecha_hora) == hoy,
                 Asistencia.tipo == "entrada",
-                func.date(Asistencia.fecha_hora) == hoy
             )
             .first()
         )
-        if ya_entro_hoy:
+        if existente:
+            # devolvemos 409 + info de la marca existente
             return (
-                jsonify({
-                    "error": "entrada_duplicada",
-                    "message": "El cliente ya registró una entrada hoy."
-                }),
-                409,  # Conflict
+                jsonify(
+                    {
+                        "error": "entrada_duplicada",
+                        "detalle": "Este cliente ya tiene una ENTRADA registrada hoy.",
+                        "ultima_hora": existente.fecha_hora.strftime("%H:%M"),
+                    }
+                ),
+                409,
             )
 
-    # 3) Registrar asistencia
+    # Verifica membresía activa SOLO para marcar "entrada"
+    if tipo == "entrada":
+        hoy = date.today()
+        cm = (
+            ClienteMembresia.query.filter_by(cliente_id=cliente_id, estado="activa")
+            .order_by(ClienteMembresia.fecha_fin.desc())
+            .first()
+        )
+        if not cm or cm.fecha_fin < hoy:
+            return jsonify({"error": "sin_membresia_activa"}), 403
+
     a = Asistencia(cliente_id=cliente_id, tipo=tipo)
     db.session.add(a)
     db.session.commit()
     return jsonify({"msg": "asistencia registrada"}), 201
 
+
 @bp.get("/asistencias/hoy")
 def asistencias_hoy():
     hoy = date.today()
-    # Trae el datetime completo y la hora la formateamos en Python
-    asist = (
+
+    # Traemos el datetime crudo y formateamos en Python (no en SQL)
+    rows = (
         db.session.query(
             Asistencia.asistencia_id,
+            Asistencia.fecha_hora,   # crudo
             Cliente.nombre,
             Cliente.apellido,
             Cliente.rut,
             Cliente.cliente_id,
-            Asistencia.fecha_hora,
+            Asistencia.tipo,
         )
         .join(Cliente)
-        .filter(cast(Asistencia.fecha_hora, Date) == hoy)
+        .filter(func.date(Asistencia.fecha_hora) == hoy, Asistencia.tipo == "entrada")
         .order_by(Asistencia.fecha_hora.desc())
         .all()
     )
 
     data = []
-    for a in asist:
-        # a es un Row: (asistencia_id, nombre, apellido, rut, cliente_id, fecha_hora)
-        asistencia_id, nombre, apellido, rut, cliente_id, fecha_hora = a
-        hora_str = fecha_hora.strftime("%H:%M") if fecha_hora else None
-        data.append(
-            {
-                "asistencia_id": asistencia_id,
-                "nombre": nombre,
-                "apellido": apellido,
-                "rut": rut,
-                "cliente_id": cliente_id,
-                "hora": hora_str,
-            }
-        )
+    for a_id, fh, nombre, apellido, rut, cid, tipo in rows:
+        data.append({
+            "asistencia_id": a_id,
+            "fecha_hora": fh.isoformat() if fh else None,   # por si lo quieres usar en el front
+            "hora": _to_local_hhmm(fh),                     # <-- LA HORA CORRECTA EN LOCAL
+            "nombre": nombre,
+            "apellido": apellido,
+            "rut": rut,
+            "cliente_id": cid,
+        })
     return jsonify(data)
-
 
 # -------------------- VENCIMIENTOS ≤ 3 días --------------------
 

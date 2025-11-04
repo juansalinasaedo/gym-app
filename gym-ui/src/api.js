@@ -74,11 +74,23 @@ export async function apiGetAsistenciasHoy() {
 }
 
 export async function apiMarcarAsistencia(body) {
-  return fetchJSON(`${BASE}/asistencias`, {
+  const res = await fetch(`${BASE}/asistencias`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+
+  // Intentamos leer JSON siempre para adjuntarlo al error si falla
+  let payload = null;
+  try { payload = await res.json(); } catch {}
+
+  if (!res.ok) {
+    const err = new Error(payload?.error || `POST /asistencias ${res.status}`);
+    err.status = res.status;
+    err.data = payload;
+    throw err;
+  }
+  return payload;
 }
 
 // ---- VENCIMIENTOS PRÓXIMOS ----
