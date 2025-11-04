@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from decimal import Decimal
 from sqlalchemy import func, cast, Date  
+from sqlalchemy.engine import Engine
 import pytz
 from zoneinfo import ZoneInfo
 from . import db
@@ -320,39 +321,60 @@ def marcar_asistencia():
     db.session.commit()
     return jsonify({"msg": "asistencia registrada"}), 201
 
+def _is_postgres(session) -> bool:
+    eng: Engine = session.get_bind()
+    return eng.dialect.name == "postgresql"
 
 @bp.get("/asistencias/hoy")
 def asistencias_hoy():
     hoy = date.today()
-
-    # Traemos el datetime crudo y formateamos en Python (no en SQL)
-    rows = (
-        db.session.query(
-            Asistencia.asistencia_id,
-            Asistencia.fecha_hora,   # crudo
-            Cliente.nombre,
-            Cliente.apellido,
-            Cliente.rut,
-            Cliente.cliente_id,
-            Asistencia.tipo,
+    if _is_postgres(db.session):
+        # PostgreSQL: convertir a America/Santiago antes de truncar a fecha y formatear hora
+        tz_expr = func.timezone("America/Santiago", Asistencia.fecha_hora)
+        fecha_local = cast(tz_expr, Date)                                  # fecha local
+        hora_local = func.to_char(tz_expr, "HH24:MI").label("hora")        # HH:MM local
+        rows = (
+            db.session.query(
+                Asistencia.asistencia_id,
+                Cliente.nombre,
+                Cliente.apellido,
+                Cliente.rut,
+                Cliente.cliente_id,
+                hora_local,
+            )
+            .join(Cliente)
+            .filter(fecha_local == hoy, Asistencia.tipo == "entrada")
+            .order_by(hora_local.asc())
+            .all()
         )
-        .join(Cliente)
-        .filter(func.date(Asistencia.fecha_hora) == hoy, Asistencia.tipo == "entrada")
-        .order_by(Asistencia.fecha_hora.desc())
-        .all()
-    )
+    else:
+        # SQLite: usar date() y strftime()
+        rows = (
+            db.session.query(
+                Asistencia.asistencia_id,
+                Cliente.nombre,
+                Cliente.apellido,
+                Cliente.rut,
+                Cliente.cliente_id,
+                func.strftime("%H:%M", Asistencia.fecha_hora).label("hora"),
+            )
+            .join(Cliente)
+            .filter(func.date(Asistencia.fecha_hora) == hoy, Asistencia.tipo == "entrada")
+            .order_by(Asistencia.fecha_hora.asc())
+            .all()
+        )
 
-    data = []
-    for a_id, fh, nombre, apellido, rut, cid, tipo in rows:
-        data.append({
-            "asistencia_id": a_id,
-            "fecha_hora": fh.isoformat() if fh else None,   # por si lo quieres usar en el front
-            "hora": _to_local_hhmm(fh),                     # <-- LA HORA CORRECTA EN LOCAL
-            "nombre": nombre,
-            "apellido": apellido,
-            "rut": rut,
-            "cliente_id": cid,
-        })
+    data = [
+        {
+            "asistencia_id": a.asistencia_id,
+            "nombre": a.nombre,
+            "apellido": a.apellido,
+            "rut": a.rut,
+            "cliente_id": a.cliente_id,
+            "hora": getattr(a, "hora", None) or "",
+        }
+        for a in rows
+    ]
     return jsonify(data)
 
 # -------------------- VENCIMIENTOS ≤ 3 días --------------------

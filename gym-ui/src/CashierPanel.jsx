@@ -397,13 +397,13 @@ export default function CashierPanel() {
 
   // === Formateador de hora para la tabla de asistencias ===
   const horaBonita = (row) => {
-    if (row.hora) return row.hora; // viene formateada desde backend
+    if (row.hora) return row.hora; // valor ya formateado desde backend
     if (row.fecha_hora) {
       try {
         const d = new Date(row.fecha_hora);
         return d.toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" });
       } catch {
-        /* ignore */
+        // ignorar errores de parsing
       }
     }
     return "";
@@ -857,6 +857,7 @@ export default function CashierPanel() {
         </form>
       </Section>
 
+        
       {/* 5) Entraron hoy */}
       <Section title="5) Entraron hoy">
         {asistenciasHoy.length === 0 ? (
@@ -876,7 +877,7 @@ export default function CashierPanel() {
                 {asistenciasHoy.map((a) => (
                   <tr key={a.asistencia_id} className="odd:bg-white even:bg-gray-50">
                     <td className="px-3 py-2 border-b border-gray-100 font-semibold text-gray-800">
-                      {horaBonita(a)}
+                       {horaBonita(a)}
                     </td>
                     <td className="px-3 py-2 border-b border-gray-100 text-gray-700">
                       {a.nombre} {a.apellido}
